@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
 """
-C to NASM Struct Converter –  cleaned-up edition
-Author  : Enhanced C to NASM Converter
-Version : 2.0
+C to NASM Struct Converter
+Author  : Alon Alush / alonalush5@gmail.com
 """
 
 import re
@@ -12,9 +10,7 @@ import argparse
 from collections import defaultdict
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  TYPE MAP
-# ────────────────────────────────────────────────────────────────────────────────
 type_map = {
     # Basic C types  ------------------------------------------------------------
     "char": "resb",
@@ -71,15 +67,10 @@ type_map = {
     "HANDLE": "resq",
     "PVOID": "resq",
     "LPVOID": "resq",
-
-    # … (everything else from your original map left unchanged to save space) …
-    # compound examples (GUID, FILETIME, …) are also still in the file
 }
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  SMALL HELPERS
-# ────────────────────────────────────────────────────────────────────────────────
 def print_banner():
     print("=" * 60)
     print("        C to NASM Struct Converter  –  v2.0")
@@ -205,9 +196,7 @@ def find_matching_brace(lines, start_idx):
     return -1
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  MAIN PARSER
-# ────────────────────────────────────────────────────────────────────────────────
 def parse_struct_body(lines):
     """Return a list[dict] describing each member inside a struct."""
     fields = []
@@ -265,9 +254,7 @@ def parse_struct_body(lines):
     return fields
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  NASM GENERATOR
-# ────────────────────────────────────────────────────────────────────────────────
 def generate_nasm_struct(name, fields):
     out = [f"struc {name}"]
     used = set()
@@ -297,9 +284,7 @@ def generate_nasm_struct(name, fields):
     return out
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  FILE-LEVEL UTILITIES
-# ────────────────────────────────────────────────────────────────────────────────
 def extract_structs(code: str):
     structs = {}
     lines = code.splitlines()
@@ -366,9 +351,7 @@ def convert_file(in_path, out_path, verbose=True):
     return True
 
 
-# ────────────────────────────────────────────────────────────────────────────────
 #  MAIN
-# ────────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
         description="C-struct → NASM struc converter",
@@ -404,4 +387,5 @@ def main():
 
     convert_file(args.input, out_file, verbose=not args.quiet)
 if __name__ == '__main__':
+
     main()
