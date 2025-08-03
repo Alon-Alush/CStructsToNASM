@@ -140,20 +140,59 @@ BASE_TYPE_MAP: Dict[str, str | None] = {
 _CAPS_PTR_RX = re.compile(r"^[A-Z0-9_]+$")
 _POINTER_RX  = re.compile(r"^(?:P|LP)?[A-Z0-9_]*_?PTR$|^P\w+$|^LP\w+$")
 
+# Type size mapping in bytes (used for sizeof() evaluation)
+TYPE_SIZES: Dict[str, int] = {
+    # Basic C / C++ scalar types
+    "char": 1, "signed char": 1, "unsigned char": 1,
+    "short": 2, "unsigned short": 2,
+    "int": 4, "unsigned int": 4,
+    "long": 4, "unsigned long": 4,  # LLP64  (Windows / MSVC)
+    "long long": 8, "unsigned long long": 8,
+    "float": 4, "double": 8, "long double": 8,
+    # stdint types
+    "int8_t": 1, "uint8_t": 1,
+    "int16_t": 2, "uint16_t": 2,
+    "int32_t": 4, "uint32_t": 4,
+    "int64_t": 8, "uint64_t": 8,
+    # Win32 typedefs
+    "BOOL": 4, "BOOLEAN": 1,
+    "BYTE": 1, "WORD": 2, "DWORD": 4, "ULONG": 4,
+    "SHORT": 2, "USHORT": 2,
+    "CHAR": 1, "UCHAR": 1,
+    "HRESULT": 4, "NTSTATUS": 4,
+    # Known fixed-size structs
+    "UNICODE_STRING": 16,
+}
+
 class TypeRegistry:
     """Resolve 'C type' → NASM reservation directive."""
     _qual_rx  = re.compile(r"\b(?:const|volatile|static|extern|struct|union|enum)\b")
     _spaces   = re.compile(r"\s+")
+    _sizeof_rx = re.compile(r"sizeof\s*\(\s*([^)]*?)\s*\)")
+    _define_rx = re.compile(r"#define\s+(\w+)\s+(.+?)(?://|/\*|$)")
 
     def __init__(self, ptr_size: int = 8) -> None:
         self.ptr_size = ptr_size
         self.dir_ptr  = PTR64_DIR if ptr_size == 8 else PTR32_DIR
         self.map: Dict[str, str] = BASE_TYPE_MAP.copy()
         self.known_structs: Set[str] = set()  # Track defined structs
+        # Pre-processor definitions table
+        self.defines: Dict[str, str] = {}
+        if ptr_size == 8:
+            self.defines["_WIN64"] = "1"
+        else:
+            self.defines["_WIN32"] = "1"
+        # Custom dynamic struct shims for very common Windows headers
+        self.map.setdefault("LIST_ENTRY", f"{self.dir_ptr} 2")
+        self.map.setdefault("CLIENT_ID", f"{self.dir_ptr} 2")
         # patch pointer-sized entries
         for k, v in list(self.map.items()):
             if v is None:
                 self.map[k] = self.dir_ptr
+        # Add sizeof-aware sizes for pointer-sized types
+        for name in ("SIZE_T", "SSIZE_T", "INT_PTR", "UINT_PTR", "LONG_PTR", "ULONG_PTR",
+                     "DWORD_PTR", "HALF_PTR", "UHALF_PTR"):
+            TYPE_SIZES[name] = ptr_size
 
     # ── helpers ───────────────────────────────────────────────────────────
     @classmethod
@@ -176,6 +215,10 @@ class TypeRegistry:
             self.map[alias] = self.map[target]
         elif target.endswith('*'):
             self.map[alias] = self.dir_ptr
+
+    def add_define(self, name: str, value: str) -> None:
+        """Register a pre-processor #define."""
+        self.defines[name] = value.strip()
 
     def resolve(self, c_type: str, is_nested_struct: bool = False) -> Tuple[str, str]:
         """
@@ -216,6 +259,74 @@ class TypeRegistry:
         # Unknown type - comment with original type
         return _dword(), f" ; {original_type}"
 
+    # ------------------------------------------------------------------
+    def _get_type_size(self, type_name: str) -> int | None:
+        """Best-effort size lookup for sizeof() evaluation."""
+        t = self._norm(type_name)
+        if t in TYPE_SIZES:
+            return TYPE_SIZES[t]
+        # Pointers
+        if t.endswith("*"):
+            return self.ptr_size
+        # Check mapping – we can infer from reservation directive
+        if t in self.map:
+            dir_parts = self.map[t].split()
+            if dir_parts:
+                base = dir_parts[0]
+                count = int(dir_parts[1]) if len(dir_parts) > 1 and dir_parts[1].isdigit() else 1
+                if base == "resb":
+                    return 1 * count
+                if base == "resw":
+                    return 2 * count
+                if base == "resd":
+                    return 4 * count
+                if base == "resq":
+                    return 8 * count
+        return None
+
+    def _evaluate_expression(self, expr: str) -> str:
+        """Evaluate arithmetic expressions that may contain sizeof() and #defines."""
+        # First – substitute #defines
+        for macro, val in self.defines.items():
+            expr = re.sub(rf"\b{re.escape(macro)}\b", val, expr)
+
+        # Substitute sizeof(...)
+        def _sizeof_repl(m: re.Match) -> str:
+            inner = m.group(1).strip()
+            sz = self._get_type_size(inner)
+            return str(sz) if sz is not None else m.group(0)
+        expr = self._sizeof_rx.sub(_sizeof_repl, expr)
+
+        # If the expression still contains identifiers (un-resolved), just return as-is
+        if re.search(r"[A-Za-z_]", expr):
+            return expr.strip()
+
+        # Safely evaluate arithmetic using ast
+        import ast, operator as op
+        _ops = {
+            ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
+            ast.FloorDiv: op.floordiv, ast.Mod: op.mod, ast.Pow: op.pow,
+            ast.LShift: op.lshift, ast.RShift: op.rshift, ast.BitAnd: op.and_,
+            ast.BitOr: op.or_, ast.BitXor: op.xor, ast.USub: op.neg, ast.UAdd: op.pos,
+        }
+
+        def _eval(node):
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, ast.Num):
+                return node.n
+            if isinstance(node, ast.BinOp):
+                return _ops[type(node.op)](_eval(node.left), _eval(node.right))
+            if isinstance(node, ast.UnaryOp):
+                return _ops[type(node.op)](_eval(node.operand))
+            raise ValueError
+
+        try:
+            tree = ast.parse(expr, mode="eval")
+            return str(int(_eval(tree.body)))
+        except Exception:
+            return expr.strip()
+
 # 2.  LEXING / PARSING HELPERS
 COMMENT_RX = re.compile(
     r"//.*?$"          # C++ 1-line
@@ -242,6 +353,75 @@ TYPEDEF_RX = re.compile(
 
 def canonicalise_whitespace(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
+# ---------------------------------------------------------------------------
+# Pre-processor helpers  (#define harvesting & simple #ifdef evaluation)
+# ---------------------------------------------------------------------------
+
+def parse_defines(code: str, reg: TypeRegistry) -> None:
+    """Harvest `#define NAME value` macros into the registry for later use."""
+    for m in reg._define_rx.finditer(code):
+        reg.add_define(m.group(1), m.group(2))
+
+
+def preprocess_code(src: str, reg: TypeRegistry) -> str:
+    """Very small subset of the C pre-processor to cull inactive blocks.
+
+    We only honour #ifdef / #ifndef / #else / #endif as well as #if BOOL-expr
+    where BOOL-expr is a simple arithmetic expression that may reference
+    previously-defined macros.  This is *not* a full pre-processor – it's just
+    enough to eliminate the typical _WIN64 vs _WIN32 branches found in Windows
+    headers so we don't emit duplicate fields.
+    """
+    out: list[str] = []
+    include_stack: list[bool] = [True]
+
+    def _eval_cond(expr: str) -> bool:
+        expr = expr.strip()
+        if not expr:
+            return False
+        # Replace "defined(MACRO)"  --> 1/0
+        expr = re.sub(r"defined\s*\(\s*(\w+)\s*\)",
+                      lambda m: "1" if m.group(1) in reg.defines else "0", expr)
+        # Replace bare identifiers
+        expr = re.sub(r"\b(\w+)\b", lambda m: reg.defines.get(m.group(1), "0")
+                      if not m.group(1).isdigit() else m.group(0), expr)
+        try:
+            return bool(int(reg._evaluate_expression(expr)))
+        except Exception:
+            return False
+
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#ifdef"):
+            macro = stripped.split()[1]
+            include_stack.append(include_stack[-1] and (macro in reg.defines))
+            continue
+        if stripped.startswith("#ifndef"):
+            macro = stripped.split()[1]
+            include_stack.append(include_stack[-1] and (macro not in reg.defines))
+            continue
+        if stripped.startswith("#if") and not stripped.startswith("#ifdef") and not stripped.startswith("#ifndef"):
+            cond_expr = stripped[3:]
+            include_stack.append(include_stack[-1] and _eval_cond(cond_expr))
+            continue
+        if stripped.startswith("#else"):
+            if len(include_stack) > 1:
+                include_stack[-1] = include_stack[-2] and not include_stack[-1]
+            continue
+        if stripped.startswith("#elif"):
+            if len(include_stack) > 1:
+                cond_expr = stripped[5:]
+                include_stack[-1] = include_stack[-2] and _eval_cond(cond_expr)
+            continue
+        if stripped.startswith("#endif"):
+            if len(include_stack) > 1:
+                include_stack.pop()
+            continue
+        # Normal line
+        if include_stack[-1]:
+            out.append(line)
+    return "\n".join(out)
 
 # 3.  STRUCT PARSER
 def _find_matching_brace(src: str, pos: int) -> int:
@@ -384,10 +564,28 @@ def _render_field(reg: TypeRegistry, fld: dict) -> str:
     
     nasm_dir, comment = reg.resolve(ctype, is_nested_struct=is_nested)
     
+    # Arrays ------------------------------------------------------------
     if "array_size" in fld:
-        return f"    .{name:<24} {nasm_dir} {fld['array_size']}{comment}"
-    
-    # Handle spacing for directives
+        size_expr = reg._evaluate_expression(fld["array_size"])
+
+        # Split directive into opcode + count (if any)
+        parts = nasm_dir.split()
+        opcode = parts[0]
+        # Infer base-count (e.g., 'resd 1'  -> base_cnt = 1)
+        base_cnt = 1
+        if len(parts) > 1 and parts[1].isdigit():
+            base_cnt = int(parts[1])
+
+        try:
+            cnt = int(size_expr) * base_cnt
+            return f"    .{name:<24} {opcode} {cnt}{comment}"
+        except ValueError:
+            if base_cnt == 1:
+                return f"    .{name:<24} {opcode} {size_expr}{comment}"
+            else:
+                return f"    .{name:<24} {opcode} ({base_cnt})*({size_expr}){comment}"
+
+    # Non-arrays --------------------------------------------------------
     if nasm_dir.startswith("res") and (nasm_dir[-1].isdigit() or "size" in nasm_dir):
         space = ""
     else:
@@ -429,8 +627,10 @@ def _selftest() -> None:
         } FOO, *PFOO;
     """
     reg = TypeRegistry(8)
-    parse_typedefs(header, reg)
-    body = extract_structs(header)[0][1]
+    parse_defines(header, reg)
+    header_clean = preprocess_code(strip_comments(header), reg)
+    parse_typedefs(header_clean, reg)
+    body = extract_structs(header_clean)[0][1]
     print(generate_nasm("FOO", parse_struct_body(body), reg))
 
 def main(argv: List[str] | None = None) -> None:
@@ -468,6 +668,9 @@ def main(argv: List[str] | None = None) -> None:
         sys.exit(f"error: {src_path} not found")
 
     code = strip_comments(src_path.read_text(encoding="utf-8", errors="ignore"))
+    parse_defines(code, reg)
+    # Apply simple pre-processor to honour _WIN64/_WIN32 guards etc.
+    code = preprocess_code(code, reg)
     parse_typedefs(code, reg)
 
     structs = extract_structs(code)
