@@ -2,7 +2,7 @@
 
 # Introduction
 
-This tool converts **C struct definitions to NASM (Netwide Assembler) format**. It supports a lot of platforms specific types (GCC/Clang/WinAPI) etc, for example (`uint64_t`, `ULONGLONG`, `unsigned __int64`, `UNICODE_STRING`). Basically, it supports any type you can think of.
+This tool converts **C struct definitions to NASM (Netwide Assembler) format**. It supports a lot of platforms specific types (GCC/Clang/WinAPI) etc, for example (`uint64_t`, `ULONGLONG`, `unsigned __int64`, `UNICODE_STRING`).
 
 # Example:
 
