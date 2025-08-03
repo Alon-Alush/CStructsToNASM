@@ -43,7 +43,7 @@ To use the script, you need to have Python 3 installed on your machine.
 ### Example usage
 
 ```
-ctonasm.py -i <structs.h> -o <structs.inc>
+python ctonasm.py -i <structs.h> -o <structs.inc>
 ```
 
 
