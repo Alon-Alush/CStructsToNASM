@@ -24,7 +24,13 @@ endstruc
 ```
 
 # Usage 
-You need to have Python 3 installed on your machine.
+
+## Binaries
+
+If you're too lazy to install Python, you can download the Windows `.exe` binary in the [Releases page](https://github.com/Alon-Alush/CStructsToNASM/releases/new).
+
+## Script 
+To use the script, you need to have Python 3 installed on your machine.
 ```
 ctonasm.py -i <structs.h> -o <structs.inc>
 ```
