@@ -26,10 +26,26 @@ endstruc
 # Usage 
 
 ## Script 
+
 To use the script, you need to have Python 3 installed on your machine.
+
+| Option         | Description                                                                   |
+| -------------- | ----------------------------------------------------------------------------- |
+| `-i <input.h>`    | **Input** C header file (required unless using `--selftest`)                  |
+| `-o <file>`    | **Output** `.inc` NASM file (default: `<input>.inc`)                              |
+| `-m {32,64}`   | Force pointer size to 32-bit or 64-bit (default based on system architecture) |
+| `-q`           | Quiet mode – suppress output except errors                                    |
+| `--list-types` | Print the internal C → NASM type mapping and exit                             |
+| `--show-regex` | Show the internal regexes used to parse C fields                              |
+| `--selftest`   | Run a built-in test case and output its NASM result                           |
+| `-h`, `--help` | Show usage help                                                               |
+
+### Example usage
+
 ```
 ctonasm.py -i <structs.h> -o <structs.inc>
 ```
+
 
 <img width="672" height="347" alt="image" src="https://github.com/user-attachments/assets/0762a8cf-7a28-45f5-b43c-b6e5eaf14ca6" />
 
