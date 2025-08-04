@@ -29,6 +29,11 @@ endstruc
 
 To use the script, you need to have Python 3 installed on your machine.
 
+You have to install `pycparser`:
+```
+pip install pycparser
+```
+
 ### Example usage
 
 ```
