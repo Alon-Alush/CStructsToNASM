@@ -3,16 +3,26 @@ C to NASM Struct Converter
 Author  : Alon Alush / alonalush5@gmail.com
 """
 
-import re
-import sys
-import os
 import argparse
+import os
+import re
 from collections import defaultdict
+from typing import Dict, List, Optional
+
+from pycparser import c_ast, c_parser
 
 
-#  TYPE MAP
-type_map = {
-    # Basic C types  ------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Type mapping
+#
+# The mapping between C primitive types and NASM reservation directives.
+# ``resb`` reserves a byte, ``resw`` reserves a word (2 bytes), ``resd``
+# reserves a double word (4 bytes) and ``resq`` reserves a quad word (8
+# bytes).  Note that long on Windows is considered a 32‑bit type, hence
+# mapped to ``resd``.  Unrecognised types fall back to ``resd`` with a
+# warning.
+type_map: Dict[str, str] = {
+    # Basic C types -----------------------------------------------------------
     "char": "resb",
     "signed char": "resb",
     "unsigned char": "resb",
@@ -26,7 +36,7 @@ type_map = {
     "signed int": "resd",
     "unsigned int": "resd",
     "unsigned": "resd",
-    "long": "resd",          # Windows long = 32-bit
+    "long": "resd",  # Windows long = 32‑bit
     "long int": "resd",
     "signed long": "resd",
     "signed long int": "resd",
@@ -40,7 +50,7 @@ type_map = {
     "unsigned long long int": "resq",
     "float": "resd",
     "double": "resq",
-    "long double": "resq",   # assume 8 bytes on win64
+    "long double": "resq",  # assume 8 bytes on win64
 
     # stdint.h ---------------------------------------------------------------
     "int8_t": "resb",
@@ -70,273 +80,533 @@ type_map = {
 }
 
 
-#  SMALL HELPERS
 def print_banner():
     print("=" * 60)
-    print("        C to NASM Struct Converter  –  v2.0")
+    print("        C to NASM Struct Converter  –  pycparser edition")
     print("=" * 60)
     print()
 
 
 def normalize_type(c_type: str) -> str:
-    """Strip qualifiers, squeeze spaces, canonicalise pointers."""
-    c_type = re.sub(r'\b(const|volatile|static|extern|struct|union|enum)\b', '',
-                    c_type).strip()
+    """Strip qualifiers, squeeze spaces, canonicalise pointers.
+
+    ``pycparser`` returns type strings as lists (e.g. ['unsigned', 'int']) for
+    primitive types.  We join them into a canonical form and perform a
+    normalisation similar to the original script.  Qualifiers such as
+    'const', 'volatile' etc. are removed, whitespace is collapsed and
+    multiple consecutive ``*`` characters are reduced to a single ``*``.
+    """
+    # remove qualifiers and storage specifiers
+    c_type = re.sub(r'\b(const|volatile|static|extern|struct|union|enum)\b', '', c_type).strip()
     c_type = re.sub(r'\s+', ' ', c_type)
+    # normalise pointer spacing
     c_type = c_type.replace(' *', '*').replace('* ', '*')
     c_type = re.sub(r'\*+', '*', c_type)
     return c_type.strip()
 
 
-def get_nasm_type(c_type: str):
-    """Return the nasm reservation directive (or dict for compound)."""
+def get_nasm_type(c_type: str) -> str:
+    """Return the NASM reservation directive for a given C type.
+
+    If the type is present in ``type_map`` we return the associated value.
+    Pointers and uppercase names are assumed to be 64‑bit and mapped to
+    ``resq``.  Unknown types trigger a warning and default to ``resd``.
+    """
     original = c_type
     c_type = normalize_type(c_type)
 
-    # Exact hit in table
+    # exact hit in table
     if c_type in type_map:
         return type_map[c_type]
 
-    # Pointers / references
+    # pointer or reference
     if c_type.endswith(('*', '&')):
-        return "resq"
+        return 'resq'
 
-    # Windows HANDLE-like uppercase names
+    # uppercase (e.g. HANDLE)
     if c_type.isupper():
-        return "resq"
+        return 'resq'
 
-    # Fallback
-    print(f"Warning: unknown type '{original}', assuming 32-bit resd")
-    return "resd"
+    # fallback with warning
+    print(f"Warning: unknown type '{original}', assuming 32‑bit resd")
+    return 'resd'
 
 
-def convert_field_to_nasm(c_type, name, array_size=None,
-                          is_bitfield=False, bitfield_size=None, comment=""):
-    """One C member  → one or more NASM lines."""
+def convert_field_to_nasm(c_type: str, name: str, array_size: Optional[str] = None,
+                          is_bitfield: bool = False, bitfield_size: Optional[int] = None,
+                          comment: str = "") -> List[str]:
+    """Convert a C member into one or more NASM lines.
+
+    The function mirrors the behaviour of the original implementation.  A
+    bit‑field always reserves a single 32‑bit word regardless of its
+    width and appends the number of bits as a comment.  Arrays multiply
+    the base directive by the given size.  Scalar fields without an
+    explicit count default to ``1`` when the NASM directive does not
+    already include a count (e.g. 'resb 16' is preserved as given).
+    """
     if is_bitfield:
+        # bitfields reserve one 32‑bit unit and annotate the width
         return [f"    .{name}    resd 1 ; bitfield {bitfield_size} bits{comment}"]
 
     nasm_type = get_nasm_type(c_type)
-
-    # compound struct in lookup table
-    if isinstance(nasm_type, dict):
-        out = []
-        for sub_name, dir_, cnt in nasm_type["fields"]:
-            out.append(
-                f"    .{name}_{sub_name}    {dir_} {cnt}"
-            )
-        return out
 
     # arrays
     if array_size:
         return [f"    .{name}    {nasm_type} {array_size}{comment}"]
 
     # simple scalar
-    if ' ' in nasm_type:          # “resb 16” etc.
+    if ' ' in nasm_type:  # e.g. 'resb 16'
         return [f"    .{name}    {nasm_type}{comment}"]
     return [f"    .{name}    {nasm_type} 1{comment}"]
 
 
-def parse_field_line(line):
+class FieldInfo:
+    """Structure for representing a flattened struct field.
+
+    Attributes
+    ----------
+    type : str
+        Canonical C type string (possibly with pointer or array notation).
+    name : str
+        Name of the field, including any prefix for nested structs.
+    array_size : Optional[str]
+        String representation of the array size if the field is an array.
+    is_bitfield : bool
+        Whether the field represents a bit‑field.
+    bitfield_size : Optional[int]
+        Number of bits in a bit‑field.
+    comment : str
+        Optional comment appended to the NASM line describing the original
+        type when it is not found in the type map.
     """
-    Extract information for one member inside a struct:
-        • 'int value;'                    → scalar
-        • 'char name[32];'                → array
-        • 'uint32_t Flags : 3;'           → bit-field
-    Returns a dict with keys:
-        type, name, and optionally array_size / is_bitfield / bitfield_size
+
+    def __init__(self, type: str, name: str,
+                 array_size: Optional[str] = None,
+                 is_bitfield: bool = False,
+                 bitfield_size: Optional[int] = None,
+                 comment: str = ""):
+        self.type = type
+        self.name = name
+        self.array_size = array_size
+        self.is_bitfield = is_bitfield
+        self.bitfield_size = bitfield_size
+        self.comment = comment
+
+
+def _typename_from_type(type_node: c_ast.Node) -> str:
+    """Return a human readable type name from a pycparser type node.
+
+    This helper walks through nested type declarations (e.g. pointers,
+    arrays, function pointers) until it reaches a ``TypeDecl``.  It then
+    extracts and joins the tokens from the contained ``IdentifierType``.
+    Pointer notation is appended using ``*``.  Array dimensions are
+    ignored here and handled separately by the caller.
     """
-    # Remove inline comments and surrounding whitespace/semicolon
-    line = re.sub(r'/\*.*?\*/', '', line)        # strip /* ... */ on the same line
-    line = re.sub(r'//.*$', '', line).strip()    # strip // ...
-    line = line.rstrip(';').strip()
+    # handle pointer: add '*' and continue
+    if isinstance(type_node, c_ast.PtrDecl):
+        base = _typename_from_type(type_node.type)
+        return f"{base}*"
 
-    # ignore blank lines
-    if not line:
-        return None
+    # handle array: treat as base type; actual dimension will be handled
+    if isinstance(type_node, c_ast.ArrayDecl):
+        base = _typename_from_type(type_node.type)
+        return base
 
-    # bit-field: type name : bits;
-    m = re.match(r'^(?P<type>.+?)\s+(?P<name>\w+)\s*:\s*(?P<bits>\d+)\s*$', line)
-    if m:
-        return {
-            "type": m.group('type'),
-            "name": m.group('name'),
-            "is_bitfield": True,
-            "bitfield_size": int(m.group('bits')),
-        }
+    # handle TypeDecl -> IdentifierType or another nested type
+    if isinstance(type_node, c_ast.TypeDecl):
+        decl = type_node.type
+        if isinstance(decl, c_ast.IdentifierType):
+            return ' '.join(decl.names)
+        if isinstance(decl, c_ast.Struct):
+            # struct as a type; return its tag name if available
+            return f"struct {decl.name}" if decl.name else "struct"
+        if isinstance(decl, c_ast.Enum):
+            return f"enum {decl.name}" if decl.name else "enum"
+        # unexpected
+        return str(decl)
 
-    # array: type name[expr];
-    m = re.match(r'^(?P<type>.+?)\s+(?P<name>\w+)\s*$$\s*(?P<size>[^$$]+)\s*\]\s*$', line)
-    if m:
-        return {
-            "type": m.group('type'),
-            "name": m.group('name'),
-            "array_size": m.group('size').strip(),
-        }
-
-    # scalar: type name;
-    m = re.match(r'^(?P<type>.+?)\s+(?P<name>\w+)\s*$', line)
-    if m:
-        return {
-            "type": m.group('type'),
-            "name": m.group('name'),
-        }
-
-    # could not parse this line
-    return None
+    # fallback for unhandled nodes
+    return str(type_node)
 
 
-def find_matching_brace(lines, start_idx):
-    depth = 0
-    for i in range(start_idx, len(lines)):
-        depth += lines[i].count('{')
-        depth -= lines[i].count('}')
-        if depth == 0:
-            return i
-    return -1
+def _flatten_decl(decl: c_ast.Decl, prefix: str = "") -> List[FieldInfo]:
+    """Flatten a pycparser ``Decl`` into a list of ``FieldInfo`` records.
 
+    Nested structs are flattened by concatenating the prefix with
+    an underscore separator.  Unions pick the first declared member as
+    representative, mirroring the original script.  Bit‑fields are
+    recognised via ``Decl.bitsize`` and recorded with their width.
+    ``PtrDecl`` and ``ArrayDecl`` nodes are translated into pointer and
+    array representations; array sizes are preserved as strings to
+    accommodate expression lengths.
+    """
+    fields: List[FieldInfo] = []
 
-#  MAIN PARSER
-def parse_struct_body(lines):
-    """Return a list[dict] describing each member inside a struct."""
-    fields = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    # compute current field name with prefix
+    field_name = prefix + decl.name if decl.name else prefix.rstrip('_')
 
-        # skip comments / blank
-        if not line or line.startswith(('#', '//', '/*')):
-            i += 1
-            continue
+    # bitfield size (if any) is stored in Decl.bitsize
+    bits = decl.bitsize
+    is_bitfield = bits is not None
+    bitfield_size = None
+    if is_bitfield:
+        # bits may be a Constant or an ID; we take the value if constant
+        if isinstance(bits, c_ast.Constant):
+            bitfield_size = int(bits.value)
+        else:
+            # non‑constant bitfield widths are preserved as None
+            bitfield_size = None
 
-        # unions – we take the *largest* member as placeholder
-        if line.startswith('union'):
-            start = i
-            if '{' not in line:
-                i += 1
-                while i < len(lines) and '{' not in lines[i]:
-                    i += 1
-            end = find_matching_brace(lines, i)
-            if end == -1:
-                break
-            # naïvely pick first member for now
-            union_member = parse_field_line(lines[i+1])
-            if union_member:
-                union_member['name'] = re.sub(r'.*}\s*', '', lines[end]).strip() or \
-                                       union_member['name']
-                fields.append(union_member)
-            i = end + 1
-            continue
+    # underlying type node
+    type_node = decl.type
 
-        # nested struct – flatten with prefix
-        if line.startswith('struct'):
-            start = i
-            if '{' not in line:
-                i += 1
-                while i < len(lines) and '{' not in lines[i]:
-                    i += 1
-            end = find_matching_brace(lines, i)
-            if end == -1:
-                break
-            nested_name = re.sub(r'.*}\s*', '', lines[end]).strip()
-            nested_body = lines[i+1:end]
-            for nf in parse_struct_body(nested_body):
-                nf['name'] = f"{nested_name}_{nf['name']}"
-                fields.append(nf)
-            i = end + 1
-            continue
+    # handle array declarations
+    if isinstance(type_node, c_ast.ArrayDecl):
+        # dimension may be a Constant, ID, or expression; we preserve the
+        # string representation as given in the original C code
+        dim = type_node.dim
+        array_size = None
+        if dim is not None:
+            # pycparser can produce an ID or a Constant or a BinaryOp
+            array_size = _expr_to_str(dim)
+        base_type_node = type_node.type
+        c_type = _typename_from_type(base_type_node)
+        comment = ''
+        norm_type = normalize_type(c_type)
+        # annotate if the type is not in the mapping and not a pointer
+        if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+            comment = f" ; {norm_type}"
+        fields.append(FieldInfo(c_type, field_name, array_size=array_size,
+                                is_bitfield=is_bitfield,
+                                bitfield_size=bitfield_size,
+                                comment=comment))
+        return fields
 
-        # plain member
-        info = parse_field_line(line)
-        if info:
-            fields.append(info)
-        i += 1
+    # handle pointer declarations
+    if isinstance(type_node, c_ast.PtrDecl):
+        c_type = _typename_from_type(type_node)
+        comment = ''
+        norm_type = normalize_type(c_type)
+        if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+            comment = f" ; {norm_type}"
+        fields.append(FieldInfo(c_type, field_name,
+                                is_bitfield=is_bitfield,
+                                bitfield_size=bitfield_size,
+                                comment=comment))
+        return fields
+
+    # handle nested struct declarations
+    if isinstance(type_node, c_ast.TypeDecl) and isinstance(type_node.type, c_ast.Struct):
+        struct_type = type_node.type
+        # nested struct may not have decls (forward declaration)
+        if not struct_type.decls:
+            # treat as opaque: we don't know the fields; reserve based on type
+            c_type = _typename_from_type(type_node)
+            comment = ''
+            norm_type = normalize_type(c_type)
+            if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+                comment = f" ; {norm_type}"
+            fields.append(FieldInfo(c_type, field_name,
+                                    is_bitfield=is_bitfield,
+                                    bitfield_size=bitfield_size,
+                                    comment=comment))
+            return fields
+        # flatten nested struct: prefix each field
+        for sub_decl in struct_type.decls:
+            sub_fields = _flatten_decl(sub_decl, prefix=f"{field_name}_")
+            fields.extend(sub_fields)
+        return fields
+
+    # handle union declarations
+    if isinstance(type_node, c_ast.TypeDecl) and isinstance(type_node.type, c_ast.Union):
+        union_type = type_node.type
+        # choose the first member of the union as representative
+        if union_type.decls:
+            first_decl = union_type.decls[0]
+            # union name is preserved; type and array information come from the first member
+            # compute type name and array size from the first member
+            sub_type_node = first_decl.type
+            # array decl: propagate array dimension
+            if isinstance(sub_type_node, c_ast.ArrayDecl):
+                dim = sub_type_node.dim
+                array_size = None
+                if dim is not None:
+                    array_size = _expr_to_str(dim)
+                base_type_node = sub_type_node.type
+                c_type = _typename_from_type(base_type_node)
+                comment = ''
+                norm = normalize_type(c_type)
+                if norm and norm not in type_map and not norm.endswith('*'):
+                    comment = f" ; {norm}"
+                fields.append(FieldInfo(c_type, field_name, array_size=array_size,
+                                        is_bitfield=is_bitfield,
+                                        bitfield_size=bitfield_size,
+                                        comment=comment))
+                return fields
+            # pointer decl: treat as pointer
+            if isinstance(sub_type_node, c_ast.PtrDecl):
+                c_type = _typename_from_type(sub_type_node)
+                comment = ''
+                norm = normalize_type(c_type)
+                if norm and norm not in type_map and not norm.endswith('*'):
+                    comment = f" ; {norm}"
+                fields.append(FieldInfo(c_type, field_name,
+                                        is_bitfield=is_bitfield,
+                                        bitfield_size=bitfield_size,
+                                        comment=comment))
+                return fields
+            # plain TypeDecl or nested struct/enum: take its type name
+            c_type = _typename_from_type(sub_type_node)
+            comment = ''
+            norm = normalize_type(c_type)
+            if norm and norm not in type_map and not norm.endswith('*'):
+                comment = f" ; {norm}"
+            fields.append(FieldInfo(c_type, field_name,
+                                    is_bitfield=is_bitfield,
+                                    bitfield_size=bitfield_size,
+                                    comment=comment))
+            return fields
+        # empty union – reserve as 32 bits
+        c_type = _typename_from_type(type_node)
+        comment = ''
+        norm_type = normalize_type(c_type)
+        if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+            comment = f" ; {norm_type}"
+        fields.append(FieldInfo(c_type, field_name,
+                                is_bitfield=is_bitfield,
+                                bitfield_size=bitfield_size,
+                                comment=comment))
+        return fields
+
+    # handle plain TypeDecl with IdentifierType or Enum
+    if isinstance(type_node, c_ast.TypeDecl):
+        c_type = _typename_from_type(type_node)
+        comment = ''
+        norm_type = normalize_type(c_type)
+        if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+            comment = f" ; {norm_type}"
+        fields.append(FieldInfo(c_type, field_name,
+                                is_bitfield=is_bitfield,
+                                bitfield_size=bitfield_size,
+                                comment=comment))
+        return fields
+
+    # catch all: treat as opaque scalar
+    c_type = _typename_from_type(type_node)
+    comment = ''
+    norm_type = normalize_type(c_type)
+    if norm_type and norm_type not in type_map and not norm_type.endswith('*'):
+        comment = f" ; {norm_type}"
+    fields.append(FieldInfo(c_type, field_name,
+                            is_bitfield=is_bitfield,
+                            bitfield_size=bitfield_size,
+                            comment=comment))
     return fields
 
 
-#  NASM GENERATOR
-def generate_nasm_struct(name, fields):
-    out = [f"struc {name}"]
+def _expr_to_str(expr: c_ast.Node) -> str:
+    """Convert an expression node to source string.
+
+    For array sizes and bit‑field widths, we need to preserve the literal
+    text.  ``pycparser`` does not provide the original text, so we fall
+    back to ``.value`` for constants or recursively reconstruct
+    identifiers and binary expressions.
+    """
+    if isinstance(expr, c_ast.Constant):
+        return expr.value
+    if isinstance(expr, c_ast.ID):
+        return expr.name
+    if isinstance(expr, c_ast.BinaryOp):
+        left = _expr_to_str(expr.left)
+        right = _expr_to_str(expr.right)
+        return f"({left} {expr.op} {right})"
+    # fallback
+    return str(expr)
+
+
+def parse_structs(code: str) -> Dict[str, List[FieldInfo]]:
+    """Parse C code and return a mapping of struct names to flattened fields.
+
+    Only ``typedef`` statements that introduce a new struct alias are
+    considered.  Anonymous structs without a typedef name are ignored,
+    mirroring common usage patterns.  Each struct's field list is
+    produced by flattening nested structs and processing arrays,
+    pointers, bit‑fields and unions accordingly.
+    """
+    # Build a preamble of dummy typedefs for non‑builtin types in our map.
+    # pycparser requires identifiers to be declared as types before use.
+    dummy_typedefs = []
+    # known C fundamental types to avoid redefining
+    builtin_types = {
+        'char', 'short', 'int', 'long', 'float', 'double', 'void', '_Bool',
+        'signed', 'unsigned'
+    }
+    for t in type_map:
+        # skip names containing whitespace (composite builtins) or pointer stars
+        if ' ' in t or '*' in t:
+            continue
+        # skip built‑in fundamental types that would result in invalid typedefs
+        if t in builtin_types:
+            continue
+        # create a dummy typedef to appease pycparser
+        dummy_typedefs.append(f"typedef int {t};")
+    preamble = '\n'.join(dummy_typedefs)
+    # Strip preprocessor directives (lines starting with '#') to help
+    # pycparser handle header files without running a real C preprocessor.
+    filtered_code = '\n'.join(
+        line for line in code.splitlines()
+        if not line.strip().startswith('#')
+    )
+    # Concatenate preamble and filtered user code.  The preamble adds
+    # typedefs for types such as uint32_t so that pycparser accepts
+    # them even if the corresponding <stdint.h> is not included.
+    filtered_code = preamble + '\n' + filtered_code
+    parser = c_parser.CParser()
+    try:
+        ast = parser.parse(filtered_code)
+    except Exception as e:
+        raise RuntimeError(f"C parsing failed: {e}")
+
+    structs: Dict[str, List[FieldInfo]] = {}
+    for ext in ast.ext:
+        # handle typedefs that alias a struct
+        if isinstance(ext, c_ast.Typedef):
+            typedef_name = ext.name
+            type_decl = ext.type
+            if isinstance(type_decl, c_ast.TypeDecl):
+                underlying = type_decl.type
+                if isinstance(underlying, c_ast.Struct):
+                    struct_type = underlying
+                    if not struct_type.decls:
+                        continue
+                    fields: List[FieldInfo] = []
+                    for decl in struct_type.decls:
+                        fields.extend(_flatten_decl(decl))
+                    structs[typedef_name] = fields
+            continue
+        # handle plain struct declarations (not typedef) of the form
+        #   struct Foo { ... };
+        # They appear as Decl nodes with type=TypeDecl(type=Struct)
+        if isinstance(ext, c_ast.Decl):
+            # Case 1: ext.type is a TypeDecl whose underlying type is a Struct
+            type_decl = ext.type
+            if isinstance(type_decl, c_ast.TypeDecl):
+                underlying = type_decl.type
+                if isinstance(underlying, c_ast.Struct):
+                    struct_type = underlying
+                    # ensure this is a definition (has decls) and has a tag name
+                    if not struct_type.decls or not struct_type.name:
+                        continue
+                    struct_name = struct_type.name
+                    if struct_name in structs:
+                        continue
+                    fields: List[FieldInfo] = []
+                    for decl in struct_type.decls:
+                        fields.extend(_flatten_decl(decl))
+                    structs[struct_name] = fields
+            # Case 2: ext.type itself is a Struct (not wrapped in TypeDecl)
+            elif isinstance(type_decl, c_ast.Struct):
+                struct_type = type_decl
+                # ensure has a tag name and decls
+                if not struct_type.decls or not struct_type.name:
+                    continue
+                struct_name = struct_type.name
+                if struct_name in structs:
+                    continue
+                fields: List[FieldInfo] = []
+                for decl in struct_type.decls:
+                    fields.extend(_flatten_decl(decl))
+                structs[struct_name] = fields
+    return structs
+
+
+def generate_nasm_struct(name: str, fields: List[FieldInfo], known_structs: Optional[set] = None) -> List[str]:
+    """Generate NASM ``struc`` block for a struct.
+
+    Names are deduplicated if necessary by appending an underscore and a
+    counter.  Fields whose type matches a previously defined struct name
+    are emitted using the NASM ``_size`` convention: for example,
+    ``struct Address address;`` becomes ``resb Address_size``.  Arrays of
+    such structs multiply the size accordingly.  All other fields are
+    converted via ``convert_field_to_nasm``.  The function returns a list
+    of strings ready for writing to the output file.
+    """
+    known_structs = known_structs or set()
+    out: List[str] = [f"struc {name}"]
     used = set()
     for fld in fields:
-        fname = fld['name']
-        # avoid duplicate names
-        n = 1
+        fname = fld.name
+        # deduplicate field names
+        suffix = 1
+        orig_name = fname
         while fname in used:
-            fname = f"{fld['name']}_{n}"
-            n += 1
+            fname = f"{orig_name}_{suffix}"
+            suffix += 1
         used.add(fname)
-
-        original_type = normalize_type(fld.get('type', ''))
-        comment = ''
-        if original_type and original_type not in type_map and not original_type.endswith('*'):
-            comment = f" ; {original_type}"
-
-        out.extend(
-            convert_field_to_nasm(fld.get('type', 'unsigned long'),
-                                  fname,
-                                  fld.get('array_size'),
-                                  fld.get('is_bitfield', False),
-                                  fld.get('bitfield_size'),
-                                  comment)
-        )
+        norm_type = normalize_type(fld.type)
+        # Check for struct reference: either 'struct Name' or alias 'Name'
+        struct_ref = None
+        if norm_type.startswith('struct '):
+            tag = norm_type.split(' ', 1)[1]
+            if tag in known_structs:
+                struct_ref = tag
+        elif norm_type in known_structs:
+            struct_ref = norm_type
+        # If it's a reference to a known struct and not a bitfield or pointer
+        if struct_ref and not fld.is_bitfield:
+            # If array, multiply size
+            if fld.array_size:
+                # produce expression <struct_ref>_size * <array_size>
+                out.append(f"    .{fname}    resb {struct_ref}_size * {fld.array_size}")
+            else:
+                out.append(f"    .{fname}    resb {struct_ref}_size")
+            continue
+        # Otherwise fall back to normal conversion
+        comment = fld.comment
+        lines = convert_field_to_nasm(fld.type, fname, fld.array_size,
+                                      fld.is_bitfield, fld.bitfield_size, comment)
+        out.extend(lines)
     out.append("endstruc")
     return out
 
 
-#  FILE-LEVEL UTILITIES
-def extract_structs(code: str):
-    structs = {}
-    lines = code.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+def convert_file(in_path: str, out_path: str, verbose: bool = True) -> bool:
+    """Convert a C header file into NASM structures using pycparser.
 
-        if line.startswith('typedef struct') or \
-           (line.startswith('struct') and '{' in line):
-
-            # locate opening brace
-            while '{' not in lines[i]:
-                i += 1
-            start = i
-            end = find_matching_brace(lines, start)
-            if end == -1:
-                break
-
-            body = lines[start + 1:end]
-            # struct name after closing brace
-            name_match = re.search(r'}\s*(\w+)', lines[end])
-            if name_match:
-                name = name_match.group(1)
-                structs[name] = body
-            i = end + 1
-            continue
-
-        i += 1
-    return structs
-
-
-def convert_file(in_path, out_path, verbose=True):
+    This function reads the source file, extracts all typedef'd structs
+    and writes corresponding NASM ``struc`` definitions into the output
+    file.  Verbose mode prints progress to stdout.  Returns ``True`` on
+    success and ``False`` on error.
+    """
     try:
-        code = open(in_path, encoding='utf-8').read()
+        with open(in_path, encoding='utf-8') as fp:
+            code = fp.read()
     except OSError as e:
         print(f"Cannot read {in_path}: {e}")
         return False
 
-    structs = extract_structs(code)
+    try:
+        structs = parse_structs(code)
+    except RuntimeError as e:
+        print(e)
+        return False
+
     if not structs:
         print("No structs found.")
         return False
 
-    output = [
-        "; Generated by C-to-NASM Struct Converter v2.0",
+    output: List[str] = [
+        "; Generated by C‑to‑NASM Struct Converter (pycparser edition)",
         f"; Source: {in_path}",
-        ""
+        "",
     ]
-    for name, body in structs.items():
+
+    # set of struct names for reference lookup
+    known_structs = set(structs.keys())
+    for name, fields in structs.items():
         if verbose:
             print(f"  > {name}")
-        output.extend(generate_nasm_struct(name, parse_struct_body(body)))
+        output.extend(generate_nasm_struct(name, fields, known_structs))
         output.append("")
 
     try:
@@ -351,11 +621,11 @@ def convert_file(in_path, out_path, verbose=True):
     return True
 
 
-#  MAIN
-def main():
+def main() -> None:
+    """Entry point for command line execution."""
     ap = argparse.ArgumentParser(
-        description="C-struct → NASM struc converter",
-        add_help=False
+        description="C‑struct → NASM struc converter (pycparser edition)",
+        add_help=False,
     )
     ap.add_argument('-i', '--input', help='C header file')
     ap.add_argument('-o', '--output', help='Output .asm file')
@@ -370,10 +640,10 @@ def main():
             print("Error: Missing required input file (-i)")
         print()
         print("Correct usage:")
-        print("    ctonasm.py -i <input.h> [-o <output.inc>]")
+        print("    ctonasm_pycparser.py -i <input.h> [-o <output.asm>]")
         print()
         print("Example:")
-        print("    ctonasm.py -i my_structs.h -o my_structs.inc")
+        print("    ctonasm_pycparser.py -i my_structs.h -o my_structs.asm")
         return
 
     out_file = args.output or (
@@ -386,6 +656,7 @@ def main():
         print()
 
     convert_file(args.input, out_file, verbose=not args.quiet)
-if __name__ == '__main__':
 
+
+if __name__ == '__main__':
     main()
